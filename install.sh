@@ -1,24 +1,77 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ─── Mole Installer & Scheduler ─────────────────────────────────────────────
-# Installs Mole (via Homebrew) and sets up launchd jobs for clean, optimize,
-# and update. Safe to re-run — always (re)configures schedules.
+# ─── Mole Scheduler ──────────────────────────────────────────────────────────
+# Sets up launchd jobs for Mole: clean, optimize, update.
+# Safe to re-run — always (re)configures schedules.
+# Usage: bash install.sh [--configure] [--debug] [--status] [--stop]
+#                        [--uninstall] [--test-mode] [--help]
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Parse arguments
+usage() {
+    cat <<EOF
+Mole Scheduler — launchd job installer for Mole (https://github.com/davydden/mole)
+
+Usage:
+  bash install.sh [flags]
+
+Flags:
+  (none)         Install with default schedules (clean Sun 2AM, optimize Wed 3AM, update Sat noon)
+  --configure    Choose schedules interactively before installing
+  --status       Show installed schedules and log info (read-only)
+  --stop         Unload all jobs without removing plists
+  --uninstall    Unload all jobs and remove all plists
+  --test-mode    Install with 2-minute intervals for soak testing
+  --debug        Print verbose output including plist XML and env info
+  --help         Show this help
+
+Flags can be combined: bash install.sh --configure --debug
+EOF
+}
+
+# ─── Argument parsing ─────────────────────────────────────────────────────────
+
 TEST_MODE=false
 STOP_MODE=false
+CONFIGURE_MODE=false
+DEBUG_MODE=false
+STATUS_MODE=false
+UNINSTALL_MODE=false
 
-if [[ "${1:-}" == "--stop" ]]; then
-    STOP_MODE=true
+for arg in "$@"; do
+    case "$arg" in
+        --test-mode)  TEST_MODE=true ;;
+        --stop)       STOP_MODE=true ;;
+        --configure)  CONFIGURE_MODE=true ;;
+        --debug)      DEBUG_MODE=true ;;
+        --status)     STATUS_MODE=true ;;
+        --uninstall)  UNINSTALL_MODE=true ;;
+        --help)       usage; exit 0 ;;
+        *)
+            echo "Unknown flag: $arg"
+            echo "Run 'bash install.sh --help' for usage."
+            exit 1
+            ;;
+    esac
+done
+
+# ─── Debug mode ───────────────────────────────────────────────────────────────
+
+if [ "$DEBUG_MODE" = true ]; then
+    echo "==> Debug mode enabled"
+    echo "  User: $(whoami)  UID: $(id -u)"
+    echo "  Shell: $SHELL"
+    set -x
+fi
+
+# ─── Stop mode ────────────────────────────────────────────────────────────────
+
+if [ "$STOP_MODE" = true ]; then
     echo "Stopping all Mole scheduled jobs..."
     echo ""
-
     sudo launchctl bootout system/com.mole.clean 2>/dev/null && echo "  ✓ Stopped com.mole.clean" || echo "  • com.mole.clean not running"
     sudo launchctl bootout system/com.mole.optimize 2>/dev/null && echo "  ✓ Stopped com.mole.optimize" || echo "  • com.mole.optimize not running"
     launchctl bootout "gui/$(id -u)/com.mole.update" 2>/dev/null && echo "  ✓ Stopped com.mole.update" || echo "  • com.mole.update not running"
-
     echo ""
     echo "All jobs stopped. To restart:"
     echo "  bash install.sh          (production mode)"
@@ -26,20 +79,129 @@ if [[ "${1:-}" == "--stop" ]]; then
     exit 0
 fi
 
-if [[ "${1:-}" == "--test-mode" ]]; then
-    TEST_MODE=true
-    echo "⚠️  TEST MODE ENABLED - Jobs will run every 2 minutes"
+# ─── Uninstall mode ───────────────────────────────────────────────────────────
+
+if [ "$UNINSTALL_MODE" = true ]; then
+    echo "Uninstalling all Mole scheduled jobs..."
     echo ""
+    sudo launchctl bootout system/com.mole.clean 2>/dev/null && echo "  ✓ Unloaded com.mole.clean" || echo "  • com.mole.clean not loaded"
+    sudo launchctl bootout system/com.mole.optimize 2>/dev/null && echo "  ✓ Unloaded com.mole.optimize" || echo "  • com.mole.optimize not loaded"
+    launchctl bootout "gui/$(id -u)/com.mole.update" 2>/dev/null && echo "  ✓ Unloaded com.mole.update" || echo "  • com.mole.update not loaded"
+    echo ""
+    sudo rm -f /Library/LaunchDaemons/com.mole.clean.plist && echo "  ✓ Removed com.mole.clean.plist" || true
+    sudo rm -f /Library/LaunchDaemons/com.mole.optimize.plist && echo "  ✓ Removed com.mole.optimize.plist" || true
+    rm -f ~/Library/LaunchAgents/com.mole.update.plist && echo "  ✓ Removed com.mole.update.plist" || true
+    echo ""
+    echo "  Logs remain at /var/log/mole/ and /tmp/mole-update.log"
+    echo "  To remove logs: sudo rm -rf /var/log/mole && rm -f /tmp/mole-update.log"
+    exit 0
 fi
 
-# 1. Refuse to run as root
+# ─── Status mode ──────────────────────────────────────────────────────────────
+
+if [ "$STATUS_MODE" = true ]; then
+    echo "Mole Scheduler — Status"
+    echo ""
+
+    # Helper: extract StartCalendarInterval from a plist and return human label
+    describe_schedule() {
+        local plist="$1"
+        if [ ! -f "$plist" ]; then
+            echo "not installed"
+            return
+        fi
+        # Check for StartInterval (test/daily interval mode)
+        local interval
+        interval=$(plutil -p "$plist" 2>/dev/null | grep -A1 '"StartInterval"' | grep 'integer' | grep -oE '[0-9]+' || true)
+        if [ -n "$interval" ]; then
+            echo "Every ${interval}s (test/interval mode)"
+            return
+        fi
+        # Parse StartCalendarInterval
+        local weekday hour day
+        weekday=$(plutil -p "$plist" 2>/dev/null | grep -A5 'StartCalendarInterval' | grep '"Weekday"' | grep -oE '[0-9]+' || true)
+        day=$(plutil -p "$plist" 2>/dev/null | grep -A5 'StartCalendarInterval' | grep '"Day"' | grep -oE '[0-9]+' || true)
+        hour=$(plutil -p "$plist" 2>/dev/null | grep -A5 'StartCalendarInterval' | grep '"Hour"' | grep -oE '[0-9]+' || true)
+
+        local hour_fmt=""
+        if [ -n "$hour" ]; then
+            if [ "$hour" -eq 0 ]; then
+                hour_fmt="12:00 AM"
+            elif [ "$hour" -lt 12 ]; then
+                hour_fmt="${hour}:00 AM"
+            elif [ "$hour" -eq 12 ]; then
+                hour_fmt="12:00 PM"
+            else
+                hour_fmt="$((hour - 12)):00 PM"
+            fi
+        fi
+
+        if [ -n "$weekday" ]; then
+            local day_names=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday)
+            echo "Weekly ${day_names[$weekday]} ${hour_fmt}"
+        elif [ -n "$day" ]; then
+            echo "Monthly day-${day} ${hour_fmt}"
+        elif [ -n "$hour" ]; then
+            echo "Daily ${hour_fmt}"
+        else
+            echo "unknown schedule"
+        fi
+    }
+
+    # Check launchctl load status
+    check_loaded() {
+        local label="$1"
+        local domain="$2"
+        if launchctl print "${domain}/${label}" &>/dev/null 2>&1; then
+            echo "LOADED"
+        elif sudo launchctl print "${domain}/${label}" &>/dev/null 2>&1; then
+            echo "LOADED"
+        else
+            echo "NOT LOADED"
+        fi
+    }
+
+    CLEAN_PLIST="/Library/LaunchDaemons/com.mole.clean.plist"
+    OPT_PLIST="/Library/LaunchDaemons/com.mole.optimize.plist"
+    UPD_PLIST="$HOME/Library/LaunchAgents/com.mole.update.plist"
+
+    CLEAN_STATUS=$(check_loaded com.mole.clean system 2>/dev/null || echo "NOT LOADED")
+    OPT_STATUS=$(check_loaded com.mole.optimize system 2>/dev/null || echo "NOT LOADED")
+    UPD_STATUS=$(check_loaded com.mole.update "gui/$(id -u)" 2>/dev/null || echo "NOT LOADED")
+
+    CLEAN_SCHED=$(describe_schedule "$CLEAN_PLIST")
+    OPT_SCHED=$(describe_schedule "$OPT_PLIST")
+    UPD_SCHED=$(describe_schedule "$UPD_PLIST")
+
+    printf "  %-22s %-12s %s\n" "com.mole.clean" "$CLEAN_STATUS" "$CLEAN_SCHED"
+    printf "  %-22s %-12s %s\n" "com.mole.optimize" "$OPT_STATUS" "$OPT_SCHED"
+    printf "  %-22s %-12s %s\n" "com.mole.update" "$UPD_STATUS" "$UPD_SCHED"
+    echo ""
+    echo "Logs:"
+
+    for logfile in /var/log/mole/clean.log /var/log/mole/optimize.log /tmp/mole-update.log; do
+        if [ -f "$logfile" ]; then
+            # macOS stat: last modified time
+            mod=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$logfile" 2>/dev/null || echo "unknown")
+            printf "  %-40s (last modified: %s)\n" "$logfile" "$mod"
+        else
+            printf "  %-40s (not found)\n" "$logfile"
+        fi
+    done
+
+    exit 0
+fi
+
+# ─── Refuse to run as root ────────────────────────────────────────────────────
+
 if [[ $EUID -eq 0 ]]; then
     echo "Error: Do not run this script as root (Homebrew won't work)."
     echo "Run as your normal user: bash install.sh"
     exit 1
 fi
 
-# 2. Check for Homebrew
+# ─── Check for Homebrew ───────────────────────────────────────────────────────
+
 if ! command -v brew &>/dev/null; then
     echo "Error: Homebrew is not installed."
     echo "Install it first:"
@@ -47,13 +209,131 @@ if ! command -v brew &>/dev/null; then
     exit 1
 fi
 
-# 3. Detect arch — both paths included in plists so they work on any Mac
+# ─── Detect arch ──────────────────────────────────────────────────────────────
+
 BREW_PREFIX="$(brew --prefix)"
 COMBINED_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-echo "Homebrew prefix: $BREW_PREFIX"
 
-# 4. Install Mole + dependencies if not already installed
-echo ""
+if [ "$DEBUG_MODE" = true ]; then
+    echo "  Brew prefix: $BREW_PREFIX"
+    echo "  Combined PATH: $COMBINED_PATH"
+fi
+
+# ─── Schedule defaults ────────────────────────────────────────────────────────
+# clean:    weekly, Sunday (0), 2 AM
+# optimize: weekly, Wednesday (3), 3 AM
+# update:   weekly, Saturday (6), noon (12)
+#
+# SCHED_TYPE: weekly | daily | monthly | skip
+# For weekly: WEEKDAY (0=Sun..6=Sat), HOUR
+# For daily:  HOUR
+# For monthly: HOUR
+
+CLEAN_TYPE="weekly"; CLEAN_WEEKDAY=0; CLEAN_HOUR=2
+OPT_TYPE="weekly";   OPT_WEEKDAY=3;   OPT_HOUR=3
+UPD_TYPE="weekly";   UPD_WEEKDAY=6;   UPD_HOUR=12
+
+# ─── Configure mode ───────────────────────────────────────────────────────────
+
+if [ "$CONFIGURE_MODE" = true ]; then
+    echo "Mole Scheduler — Configure Schedules"
+    echo ""
+
+    prompt_schedule() {
+        local job_label="$1"   # e.g. "mo clean"
+        local default_choice="$2"  # 1-4
+        local w1_label="$3"    # weekly label e.g. "Sunday 2 AM"
+        local d_label="$4"     # daily label  e.g. "2 AM"
+        local m_label="$5"     # monthly label e.g. "1st of month 2 AM"
+
+        echo "  ${job_label}:" >&2
+        echo "    1) Weekly  — ${w1_label}  (default)" >&2
+        echo "    2) Daily   — ${d_label}" >&2
+        echo "    3) Monthly — ${m_label}" >&2
+        echo "    4) Skip    — don't schedule" >&2
+
+        local choice=""
+        while true; do
+            printf "  Choice [%s]: " "$default_choice" >&2
+            read -r choice </dev/tty
+            choice="${choice:-$default_choice}"
+            case "$choice" in
+                1|2|3|4) break ;;
+                *) echo "    Please enter 1, 2, 3, or 4." >&2 ;;
+            esac
+        done
+        echo "" >&2
+        echo "$choice"
+    }
+
+    # Clean
+    CLEAN_CHOICE=$(prompt_schedule "mo clean" "1" "Sunday 2 AM" "2 AM" "1st of month 2 AM")
+    case "$CLEAN_CHOICE" in
+        1) CLEAN_TYPE="weekly";  CLEAN_WEEKDAY=0; CLEAN_HOUR=2 ;;
+        2) CLEAN_TYPE="daily";   CLEAN_HOUR=2 ;;
+        3) CLEAN_TYPE="monthly"; CLEAN_HOUR=2 ;;
+        4) CLEAN_TYPE="skip" ;;
+    esac
+
+    # Optimize
+    OPT_CHOICE=$(prompt_schedule "mo optimize" "1" "Wednesday 3 AM" "3 AM" "1st of month 3 AM")
+    case "$OPT_CHOICE" in
+        1) OPT_TYPE="weekly";  OPT_WEEKDAY=3; OPT_HOUR=3 ;;
+        2) OPT_TYPE="daily";   OPT_HOUR=3 ;;
+        3) OPT_TYPE="monthly"; OPT_HOUR=3 ;;
+        4) OPT_TYPE="skip" ;;
+    esac
+
+    # Update
+    UPD_CHOICE=$(prompt_schedule "brew upgrade mole" "1" "Saturday noon" "noon" "1st of month noon")
+    case "$UPD_CHOICE" in
+        1) UPD_TYPE="weekly";  UPD_WEEKDAY=6; UPD_HOUR=12 ;;
+        2) UPD_TYPE="daily";   UPD_HOUR=12 ;;
+        3) UPD_TYPE="monthly"; UPD_HOUR=12 ;;
+        4) UPD_TYPE="skip" ;;
+    esac
+
+    # Summary
+    echo "  Schedule summary:"
+    fmt_schedule() {
+        local type="$1" weekday="${2:-}" hour="${3:-}"
+        local day_names=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday)
+        local hour_fmt=""
+        if [ -n "$hour" ]; then
+            if [ "$hour" -eq 0 ]; then hour_fmt="12:00 AM"
+            elif [ "$hour" -lt 12 ]; then hour_fmt="${hour}:00 AM"
+            elif [ "$hour" -eq 12 ]; then hour_fmt="12:00 PM"
+            else hour_fmt="$((hour-12)):00 PM"; fi
+        fi
+        case "$type" in
+            weekly)  echo "Weekly  ${day_names[$weekday]} ${hour_fmt}" ;;
+            daily)   echo "Daily   ${hour_fmt}" ;;
+            monthly) echo "Monthly 1st-of-month ${hour_fmt}" ;;
+            skip)    echo "Skipped" ;;
+        esac
+    }
+    printf "    %-14s %s\n" "mo clean"     "$(fmt_schedule "$CLEAN_TYPE" "${CLEAN_WEEKDAY:-}" "${CLEAN_HOUR:-}")"
+    printf "    %-14s %s\n" "mo optimize"  "$(fmt_schedule "$OPT_TYPE"   "${OPT_WEEKDAY:-}"   "${OPT_HOUR:-}")"
+    printf "    %-14s %s\n" "brew upgrade" "$(fmt_schedule "$UPD_TYPE"   "${UPD_WEEKDAY:-}"   "${UPD_HOUR:-}")"
+    echo ""
+
+    printf "  Proceed? [Y/n]: "
+    read -r confirm </dev/tty
+    confirm="${confirm:-Y}"
+    if [[ "$confirm" =~ ^[Nn] ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+    echo ""
+fi
+
+if [ "$TEST_MODE" = true ]; then
+    echo "Warning: TEST MODE ENABLED - Jobs will run every 2 minutes"
+    echo ""
+fi
+
+# ─── Install Mole + dependencies ─────────────────────────────────────────────
+
 echo "==> Checking Mole and dependencies..."
 for pkg in mole jq bc; do
     if brew list "$pkg" &>/dev/null; then
@@ -66,283 +346,256 @@ done
 
 MO_PATH="$(command -v mo)"
 echo ""
+echo "Homebrew prefix: $BREW_PREFIX"
 echo "Mole binary: $MO_PATH"
 
-# 5. Create log dir
+# ─── Create log dir ───────────────────────────────────────────────────────────
+
 echo ""
 echo "==> Creating /var/log/mole (requires sudo)..."
 sudo mkdir -p /var/log/mole
 
-# 6. Install LaunchDaemons (run as root) for clean + optimize
+# ─── Plist helpers ────────────────────────────────────────────────────────────
+
+# Build the StartCalendarInterval or StartInterval XML block
+build_schedule_xml() {
+    local type="$1"
+    local weekday="${2:-0}"
+    local hour="${3:-0}"
+
+    if [ "$TEST_MODE" = true ]; then
+        printf '    <key>StartInterval</key>\n    <integer>120</integer>\n'
+        return
+    fi
+
+    case "$type" in
+        weekly)
+            printf '    <key>StartCalendarInterval</key>\n    <dict>\n'
+            printf '        <key>Weekday</key>\n        <integer>%d</integer>\n' "$weekday"
+            printf '        <key>Hour</key>\n        <integer>%d</integer>\n' "$hour"
+            printf '        <key>Minute</key>\n        <integer>0</integer>\n'
+            printf '    </dict>\n'
+            ;;
+        daily)
+            printf '    <key>StartCalendarInterval</key>\n    <dict>\n'
+            printf '        <key>Hour</key>\n        <integer>%d</integer>\n' "$hour"
+            printf '        <key>Minute</key>\n        <integer>0</integer>\n'
+            printf '    </dict>\n'
+            ;;
+        monthly)
+            printf '    <key>StartCalendarInterval</key>\n    <dict>\n'
+            printf '        <key>Day</key>\n        <integer>1</integer>\n'
+            printf '        <key>Hour</key>\n        <integer>%d</integer>\n' "$hour"
+            printf '        <key>Minute</key>\n        <integer>0</integer>\n'
+            printf '    </dict>\n'
+            ;;
+    esac
+}
+
+write_daemon_plist() {
+    local label="$1"
+    local dest="$2"
+    local cmd_string="$3"
+    local log_path="$4"
+    local schedule_xml="$5"
+
+    local plist_content
+    plist_content="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>${cmd_string}</string>
+    </array>
+${schedule_xml}    <key>StandardOutPath</key>
+    <string>${log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>${log_path}</string>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>"
+
+    if [ "$DEBUG_MODE" = true ]; then
+        echo "--- Plist: $dest ---"
+        echo "$plist_content"
+        echo "---"
+        echo "$plist_content" | sudo tee "$dest"
+    else
+        echo "$plist_content" | sudo tee "$dest" > /dev/null
+    fi
+}
+
+write_agent_plist() {
+    local label="$1"
+    local dest="$2"
+    local cmd_string="$3"
+    local log_path="$4"
+    local schedule_xml="$5"
+
+    local plist_content
+    plist_content="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>${cmd_string}</string>
+    </array>
+${schedule_xml}    <key>StandardOutPath</key>
+    <string>${log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>${log_path}</string>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>"
+
+    if [ "$DEBUG_MODE" = true ]; then
+        echo "--- Plist: $dest ---"
+        echo "$plist_content"
+        echo "---"
+        echo "$plist_content" | tee "$dest"
+    else
+        echo "$plist_content" > "$dest"
+    fi
+}
+
+# ─── Install LaunchDaemons (clean + optimize) ─────────────────────────────────
 
 echo ""
 echo "==> Installing LaunchDaemons..."
 
-# --- com.mole.clean.plist ---
-if [ "$TEST_MODE" = true ]; then
-    # Test mode: run every 2 minutes
-    sudo tee /Library/LaunchDaemons/com.mole.clean.plist > /dev/null << 'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.mole.clean</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; LOGUSER=$(stat -f%Su /dev/console 2&gt;/dev/null || echo &quot;root&quot;); export HOME=$(eval echo ~$LOGUSER); TIMESTAMP=$(date &quot;+%Y-%m-%d %H:%M:%S&quot;); echo &quot;[$TIMESTAMP] Starting mo clean&quot; &gt;&gt; /var/log/mole/clean.log; OUTPUT=$(mo clean 2&gt;&amp;1); EXITCODE=$?; echo &quot;$OUTPUT&quot; &gt;&gt; /var/log/mole/clean.log; echo &quot;[$TIMESTAMP] Finished (exit code: $EXITCODE)&quot; &gt;&gt; /var/log/mole/clean.log; if [ $EXITCODE -eq 0 ]; then SAVED=$(echo &quot;$OUTPUT&quot; | grep &quot;Space freed:&quot; | grep -oE &quot;[0-9]+(\.[0-9]+)?\s*(GB|MB|KB|B)&quot; | head -1); if [ &quot;$LOGUSER&quot; != &quot;root&quot; ] &amp;&amp; [ -n &quot;$SAVED&quot; ]; then LOGUID=$(id -u &quot;$LOGUSER&quot;); launchctl asuser &quot;$LOGUID&quot; sudo -u &quot;$LOGUSER&quot; osascript -e &quot;display notification \&quot;Freed: $SAVED\&quot; with title \&quot;Mole Clean Complete\&quot;&quot; 2&gt;&gt; /var/log/mole/clean.log || true; fi; fi</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>120</integer>
-    <key>StandardOutPath</key>
-    <string>/var/log/mole/clean.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/mole/clean.log</string>
-    <key>Nice</key>
-    <integer>10</integer>
-    <key>LowPriorityIO</key>
-    <true/>
-</dict>
-</plist>
-PLIST
+# Shared inline command strings (XML-escaped for plist)
+CLEAN_CMD='export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; LOGUSER=$(stat -f%Su /dev/console 2>/dev/null || echo "root"); export HOME=$(eval echo ~$LOGUSER); TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S"); echo "[$TIMESTAMP] Starting mo clean" >> /var/log/mole/clean.log; OUTPUT=$(mo clean 2>&1); EXITCODE=$?; echo "$OUTPUT" >> /var/log/mole/clean.log; echo "[$TIMESTAMP] Finished (exit code: $EXITCODE)" >> /var/log/mole/clean.log; if [ $EXITCODE -eq 0 ]; then SAVED=$(echo "$OUTPUT" | grep "Space freed:" | grep -oE "[0-9]+(\.[0-9]+)?\s*(GB|MB|KB|B)" | head -1); if [ "$LOGUSER" != "root" ] && [ -n "$SAVED" ]; then LOGUID=$(id -u "$LOGUSER"); launchctl asuser "$LOGUID" sudo -u "$LOGUSER" osascript -e "display notification \"Freed: $SAVED\" with title \"Mole Clean Complete\"" 2>> /var/log/mole/clean.log || true; fi; fi'
+
+OPT_CMD='export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; LOGUSER=$(stat -f%Su /dev/console 2>/dev/null || echo "root"); export HOME=$(eval echo ~$LOGUSER); TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S"); echo "[$TIMESTAMP] Starting mo optimize" >> /var/log/mole/optimize.log; OUTPUT=$(mo optimize 2>&1); EXITCODE=$?; echo "$OUTPUT" >> /var/log/mole/optimize.log; echo "[$TIMESTAMP] Finished (exit code: $EXITCODE)" >> /var/log/mole/optimize.log; if [ $EXITCODE -eq 0 ] && [ "$LOGUSER" != "root" ]; then LOGUID=$(id -u "$LOGUSER"); launchctl asuser "$LOGUID" sudo -u "$LOGUSER" osascript -e "display notification \"Optimize completed\" with title \"Mole Optimize Complete\"" 2>> /var/log/mole/optimize.log || true; fi'
+
+UPD_CMD='export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S"); echo "[$TIMESTAMP] Starting brew upgrade mole" >> /tmp/mole-update.log; export HOMEBREW_NO_AUTO_UPDATE=1; OUTPUT=$(brew upgrade mole 2>&1); EXITCODE=$?; echo "$OUTPUT" >> /tmp/mole-update.log; echo "[$TIMESTAMP] Finished (exit code: $EXITCODE)" >> /tmp/mole-update.log; if [ $EXITCODE -eq 0 ]; then if echo "$OUTPUT" | grep -qi "already"; then MSG="Already up to date"; else MSG="Updated successfully"; fi; osascript -e "display notification \"$MSG\" with title \"Mole Update\"" 2>/dev/null || true; else MSG="Update failed (check log)"; osascript -e "display notification \"$MSG\" with title \"Mole Update\"" 2>/dev/null || true; fi'
+
+# XML-escape the command strings for embedding in plist
+xml_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    s="${s//\"/&quot;}"
+    echo "$s"
+}
+
+CLEAN_CMD_XML=$(xml_escape "$CLEAN_CMD")
+OPT_CMD_XML=$(xml_escape "$OPT_CMD")
+UPD_CMD_XML=$(xml_escape "$UPD_CMD")
+
+# --- com.mole.clean ---
+if [ "$CLEAN_TYPE" != "skip" ]; then
+    CLEAN_SCHED_XML=$(build_schedule_xml "$CLEAN_TYPE" "${CLEAN_WEEKDAY:-0}" "${CLEAN_HOUR:-2}")
+    write_daemon_plist "com.mole.clean" "/Library/LaunchDaemons/com.mole.clean.plist" \
+        "$CLEAN_CMD_XML" "/var/log/mole/clean.log" "$CLEAN_SCHED_XML"
+    sudo chown root:wheel /Library/LaunchDaemons/com.mole.clean.plist
+    sudo chmod 644 /Library/LaunchDaemons/com.mole.clean.plist
+    echo "  com.mole.clean.plist installed"
 else
-    # Production mode: run weekly on Sunday at 2 AM
-    sudo tee /Library/LaunchDaemons/com.mole.clean.plist > /dev/null << 'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.mole.clean</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; LOGUSER=$(stat -f%Su /dev/console 2&gt;/dev/null || echo &quot;root&quot;); export HOME=$(eval echo ~$LOGUSER); TIMESTAMP=$(date &quot;+%Y-%m-%d %H:%M:%S&quot;); echo &quot;[$TIMESTAMP] Starting mo clean&quot; &gt;&gt; /var/log/mole/clean.log; OUTPUT=$(mo clean 2&gt;&amp;1); EXITCODE=$?; echo &quot;$OUTPUT&quot; &gt;&gt; /var/log/mole/clean.log; echo &quot;[$TIMESTAMP] Finished (exit code: $EXITCODE)&quot; &gt;&gt; /var/log/mole/clean.log; if [ $EXITCODE -eq 0 ]; then SAVED=$(echo &quot;$OUTPUT&quot; | grep &quot;Space freed:&quot; | grep -oE &quot;[0-9]+(\.[0-9]+)?\s*(GB|MB|KB|B)&quot; | head -1); if [ &quot;$LOGUSER&quot; != &quot;root&quot; ] &amp;&amp; [ -n &quot;$SAVED&quot; ]; then LOGUID=$(id -u &quot;$LOGUSER&quot;); launchctl asuser &quot;$LOGUID&quot; sudo -u &quot;$LOGUSER&quot; osascript -e &quot;display notification \&quot;Freed: $SAVED\&quot; with title \&quot;Mole Clean Complete\&quot;&quot; 2&gt;&gt; /var/log/mole/clean.log || true; fi; fi</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Weekday</key>
-        <integer>0</integer>
-        <key>Hour</key>
-        <integer>2</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>/var/log/mole/clean.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/mole/clean.log</string>
-    <key>Nice</key>
-    <integer>10</integer>
-    <key>LowPriorityIO</key>
-    <true/>
-</dict>
-</plist>
-PLIST
+    echo "  com.mole.clean: skipped"
 fi
 
-sudo chown root:wheel /Library/LaunchDaemons/com.mole.clean.plist
-sudo chmod 644 /Library/LaunchDaemons/com.mole.clean.plist
-echo "  com.mole.clean.plist installed"
-
-# --- com.mole.optimize.plist ---
-if [ "$TEST_MODE" = true ]; then
-    # Test mode: run every 2 minutes
-    sudo tee /Library/LaunchDaemons/com.mole.optimize.plist > /dev/null << 'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.mole.optimize</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; LOGUSER=$(stat -f%Su /dev/console 2&gt;/dev/null || echo &quot;root&quot;); export HOME=$(eval echo ~$LOGUSER); TIMESTAMP=$(date &quot;+%Y-%m-%d %H:%M:%S&quot;); echo &quot;[$TIMESTAMP] Starting mo optimize&quot; &gt;&gt; /var/log/mole/optimize.log; OUTPUT=$(mo optimize 2&gt;&amp;1); EXITCODE=$?; echo &quot;$OUTPUT&quot; &gt;&gt; /var/log/mole/optimize.log; echo &quot;[$TIMESTAMP] Finished (exit code: $EXITCODE)&quot; &gt;&gt; /var/log/mole/optimize.log; if [ $EXITCODE -eq 0 ] &amp;&amp; [ &quot;$LOGUSER&quot; != &quot;root&quot; ]; then LOGUID=$(id -u &quot;$LOGUSER&quot;); launchctl asuser &quot;$LOGUID&quot; sudo -u &quot;$LOGUSER&quot; osascript -e &quot;display notification \&quot;Optimize completed\&quot; with title \&quot;Mole Optimize Complete\&quot;&quot; 2&gt;&gt; /var/log/mole/optimize.log || true; fi</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>120</integer>
-    <key>StandardOutPath</key>
-    <string>/var/log/mole/optimize.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/mole/optimize.log</string>
-    <key>Nice</key>
-    <integer>10</integer>
-    <key>LowPriorityIO</key>
-    <true/>
-</dict>
-</plist>
-PLIST
+# --- com.mole.optimize ---
+if [ "$OPT_TYPE" != "skip" ]; then
+    OPT_SCHED_XML=$(build_schedule_xml "$OPT_TYPE" "${OPT_WEEKDAY:-3}" "${OPT_HOUR:-3}")
+    write_daemon_plist "com.mole.optimize" "/Library/LaunchDaemons/com.mole.optimize.plist" \
+        "$OPT_CMD_XML" "/var/log/mole/optimize.log" "$OPT_SCHED_XML"
+    sudo chown root:wheel /Library/LaunchDaemons/com.mole.optimize.plist
+    sudo chmod 644 /Library/LaunchDaemons/com.mole.optimize.plist
+    echo "  com.mole.optimize.plist installed"
 else
-    # Production mode: run weekly on Wednesday at 3 AM
-    sudo tee /Library/LaunchDaemons/com.mole.optimize.plist > /dev/null << 'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.mole.optimize</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; LOGUSER=$(stat -f%Su /dev/console 2&gt;/dev/null || echo &quot;root&quot;); export HOME=$(eval echo ~$LOGUSER); TIMESTAMP=$(date &quot;+%Y-%m-%d %H:%M:%S&quot;); echo &quot;[$TIMESTAMP] Starting mo optimize&quot; &gt;&gt; /var/log/mole/optimize.log; OUTPUT=$(mo optimize 2&gt;&amp;1); EXITCODE=$?; echo &quot;$OUTPUT&quot; &gt;&gt; /var/log/mole/optimize.log; echo &quot;[$TIMESTAMP] Finished (exit code: $EXITCODE)&quot; &gt;&gt; /var/log/mole/optimize.log; if [ $EXITCODE -eq 0 ] &amp;&amp; [ &quot;$LOGUSER&quot; != &quot;root&quot; ]; then LOGUID=$(id -u &quot;$LOGUSER&quot;); launchctl asuser &quot;$LOGUID&quot; sudo -u &quot;$LOGUSER&quot; osascript -e &quot;display notification \&quot;Optimize completed\&quot; with title \&quot;Mole Optimize Complete\&quot;&quot; 2&gt;&gt; /var/log/mole/optimize.log || true; fi</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Weekday</key>
-        <integer>3</integer>
-        <key>Hour</key>
-        <integer>3</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>/var/log/mole/optimize.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/mole/optimize.log</string>
-    <key>Nice</key>
-    <integer>10</integer>
-    <key>LowPriorityIO</key>
-    <true/>
-</dict>
-</plist>
-PLIST
+    echo "  com.mole.optimize: skipped"
 fi
 
-sudo chown root:wheel /Library/LaunchDaemons/com.mole.optimize.plist
-sudo chmod 644 /Library/LaunchDaemons/com.mole.optimize.plist
-echo "  com.mole.optimize.plist installed"
-
-# 7. Install LaunchAgent (run as user) for update
+# ─── Install LaunchAgent (update — runs as user) ──────────────────────────────
 
 echo ""
 echo "==> Installing LaunchAgent..."
-
 mkdir -p ~/Library/LaunchAgents
 
-if [ "$TEST_MODE" = true ]; then
-    # Test mode: run every 2 minutes
-    cat > ~/Library/LaunchAgents/com.mole.update.plist << 'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.mole.update</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; TIMESTAMP=$(date &quot;+%Y-%m-%d %H:%M:%S&quot;); echo &quot;[$TIMESTAMP] Starting brew upgrade mole&quot; &gt;&gt; /tmp/mole-update.log; export HOMEBREW_NO_AUTO_UPDATE=1; OUTPUT=$(brew upgrade mole 2&gt;&amp;1); EXITCODE=$?; echo &quot;$OUTPUT&quot; &gt;&gt; /tmp/mole-update.log; echo &quot;[$TIMESTAMP] Finished (exit code: $EXITCODE)&quot; &gt;&gt; /tmp/mole-update.log; if [ $EXITCODE -eq 0 ]; then if echo &quot;$OUTPUT&quot; | grep -qi &quot;already&quot;; then MSG=&quot;Already up to date&quot;; else MSG=&quot;Updated successfully&quot;; fi; osascript -e &quot;display notification \&quot;$MSG\&quot; with title \&quot;Mole Update\&quot;&quot; 2&gt;/dev/null || true; else MSG=&quot;Update failed (check log)&quot;; osascript -e &quot;display notification \&quot;$MSG\&quot; with title \&quot;Mole Update\&quot;&quot; 2&gt;/dev/null || true; fi</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>120</integer>
-    <key>StandardOutPath</key>
-    <string>/tmp/mole-update.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/mole-update.log</string>
-    <key>Nice</key>
-    <integer>10</integer>
-    <key>LowPriorityIO</key>
-    <true/>
-</dict>
-</plist>
-PLIST
+if [ "$UPD_TYPE" != "skip" ]; then
+    UPD_SCHED_XML=$(build_schedule_xml "$UPD_TYPE" "${UPD_WEEKDAY:-6}" "${UPD_HOUR:-12}")
+    write_agent_plist "com.mole.update" "$HOME/Library/LaunchAgents/com.mole.update.plist" \
+        "$UPD_CMD_XML" "/tmp/mole-update.log" "$UPD_SCHED_XML"
+    echo "  com.mole.update.plist installed"
 else
-    # Production mode: run weekly on Saturday at 12 PM
-    cat > ~/Library/LaunchAgents/com.mole.update.plist << 'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.mole.update</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; TIMESTAMP=$(date &quot;+%Y-%m-%d %H:%M:%S&quot;); echo &quot;[$TIMESTAMP] Starting brew upgrade mole&quot; &gt;&gt; /tmp/mole-update.log; export HOMEBREW_NO_AUTO_UPDATE=1; OUTPUT=$(brew upgrade mole 2&gt;&amp;1); EXITCODE=$?; echo &quot;$OUTPUT&quot; &gt;&gt; /tmp/mole-update.log; echo &quot;[$TIMESTAMP] Finished (exit code: $EXITCODE)&quot; &gt;&gt; /tmp/mole-update.log; if [ $EXITCODE -eq 0 ]; then if echo &quot;$OUTPUT&quot; | grep -qi &quot;already&quot;; then MSG=&quot;Already up to date&quot;; else MSG=&quot;Updated successfully&quot;; fi; osascript -e &quot;display notification \&quot;$MSG\&quot; with title \&quot;Mole Update\&quot;&quot; 2&gt;/dev/null || true; else MSG=&quot;Update failed (check log)&quot;; osascript -e &quot;display notification \&quot;$MSG\&quot; with title \&quot;Mole Update\&quot;&quot; 2&gt;/dev/null || true; fi</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Weekday</key>
-        <integer>6</integer>
-        <key>Hour</key>
-        <integer>12</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>/tmp/mole-update.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/mole-update.log</string>
-    <key>Nice</key>
-    <integer>10</integer>
-    <key>LowPriorityIO</key>
-    <true/>
-</dict>
-</plist>
-PLIST
+    echo "  com.mole.update: skipped"
 fi
 
-echo "  com.mole.update.plist installed"
-
-# 8. Unload old + load new (idempotent)
+# ─── Load jobs ────────────────────────────────────────────────────────────────
 
 echo ""
 echo "==> Loading launchd jobs..."
 
-# Unload existing (ignore errors if not loaded)
+# Unload existing (idempotent)
 sudo launchctl bootout system/com.mole.clean 2>/dev/null || true
 sudo launchctl bootout system/com.mole.optimize 2>/dev/null || true
 launchctl bootout "gui/$(id -u)/com.mole.update" 2>/dev/null || true
 
-# Load new
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.mole.clean.plist
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.mole.optimize.plist
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.mole.update.plist
+# Load new (only if not skipped)
+[ "$CLEAN_TYPE" != "skip" ] && sudo launchctl bootstrap system /Library/LaunchDaemons/com.mole.clean.plist
+[ "$OPT_TYPE"   != "skip" ] && sudo launchctl bootstrap system /Library/LaunchDaemons/com.mole.optimize.plist
+[ "$UPD_TYPE"   != "skip" ] && launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.mole.update.plist
 
 echo "  All jobs loaded"
 
-# 9. Summary + verification
+# ─── Summary ─────────────────────────────────────────────────────────────────
+
+fmt_sched_summary() {
+    local type="$1" weekday="${2:-}" hour="${3:-}"
+    local day_names=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday)
+    local hour_fmt=""
+    if [ -n "$hour" ]; then
+        if [ "$hour" -eq 0 ]; then hour_fmt="12:00 AM"
+        elif [ "$hour" -lt 12 ]; then hour_fmt="${hour}:00 AM"
+        elif [ "$hour" -eq 12 ]; then hour_fmt="12:00 PM"
+        else hour_fmt="$((hour-12)):00 PM"; fi
+    fi
+    case "$type" in
+        weekly)  printf "Weekly  %-12s %s" "${day_names[$weekday]}" "$hour_fmt" ;;
+        daily)   printf "Daily   %s" "$hour_fmt" ;;
+        monthly) printf "Monthly 1st-of-month %s" "$hour_fmt" ;;
+        skip)    printf "Skipped" ;;
+    esac
+}
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 if [ "$TEST_MODE" = true ]; then
-    echo "  Mole Installer — Complete (TEST MODE)"
+    echo "  Mole Scheduler — Complete (TEST MODE)"
 else
-    echo "  Mole Installer — Complete"
+    echo "  Mole Scheduler — Complete"
 fi
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 if [ "$TEST_MODE" = true ]; then
-    echo "  ⚠️  TEST MODE Schedule (every 2 minutes):"
-    echo "    mo clean      Every 2 min  (root, LaunchDaemon)"
-    echo "    mo optimize   Every 2 min  (root, LaunchDaemon)"
-    echo "    brew upgrade  Every 2 min  (user, LaunchAgent)"
-    echo ""
-    echo "  To stop all jobs:"
-    echo "    bash install.sh --stop"
-    echo ""
-    echo "  To switch to production schedule:"
-    echo "    bash install.sh"
+    echo "  Schedule (every 2 minutes — test mode):"
+    [ "$CLEAN_TYPE" != "skip" ] && echo "    mo clean      Every 2 min  (root, LaunchDaemon)"
+    [ "$OPT_TYPE"   != "skip" ] && echo "    mo optimize   Every 2 min  (root, LaunchDaemon)"
+    [ "$UPD_TYPE"   != "skip" ] && echo "    brew upgrade  Every 2 min  (user, LaunchAgent)"
 else
     echo "  Schedule:"
-    echo "    mo clean      Sunday    2:00 AM   (root, LaunchDaemon)"
-    echo "    mo optimize   Wednesday 3:00 AM   (root, LaunchDaemon)"
-    echo "    brew upgrade  Saturday  12:00 PM  (user, LaunchAgent)"
+    [ "$CLEAN_TYPE" != "skip" ] && printf "    %-14s %s\n" "mo clean"     "$(fmt_sched_summary "$CLEAN_TYPE" "${CLEAN_WEEKDAY:-}" "${CLEAN_HOUR:-}")"
+    [ "$OPT_TYPE"   != "skip" ] && printf "    %-14s %s\n" "mo optimize"  "$(fmt_sched_summary "$OPT_TYPE"   "${OPT_WEEKDAY:-}"   "${OPT_HOUR:-}")"
+    [ "$UPD_TYPE"   != "skip" ] && printf "    %-14s %s\n" "brew upgrade" "$(fmt_sched_summary "$UPD_TYPE"   "${UPD_WEEKDAY:-}"   "${UPD_HOUR:-}")"
 fi
-echo ""
-echo "  Notifications:"
-echo "    ✓ Success notifications enabled for all jobs"
-echo "    ✓ Clean: shows amount freed"
-echo "    ✓ Optimize: simple completion message"
-echo "    ✓ Update: shows if updated or already current"
 echo ""
 echo "  Logs (timestamped):"
 echo "    /var/log/mole/clean.log"
@@ -358,10 +611,5 @@ echo "    sudo launchctl kickstart system/com.mole.clean"
 echo "    sudo launchctl kickstart system/com.mole.optimize"
 echo ""
 echo "  Uninstall:"
-echo "    sudo launchctl bootout system/com.mole.clean 2>/dev/null"
-echo "    sudo launchctl bootout system/com.mole.optimize 2>/dev/null"
-echo "    launchctl bootout gui/\$(id -u)/com.mole.update 2>/dev/null"
-echo "    sudo rm -f /Library/LaunchDaemons/com.mole.{clean,optimize}.plist"
-echo "    rm -f ~/Library/LaunchAgents/com.mole.update.plist"
-echo "    sudo rm -rf /var/log/mole"
+echo "    bash install.sh --uninstall"
 echo ""

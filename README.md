@@ -1,17 +1,17 @@
-# Mole Installer & Scheduler
+# Mole Scheduler
 
-Automated installer for [Mole](https://github.com/davydden/mole) with scheduled background maintenance tasks for macOS.
+A simple macOS scheduler for [Mole](https://github.com/davydden/mole). Configure and automate Mole's clean, optimize, and update tasks using launchd.
 
 ## What it does
 
 Single self-contained script that:
 - Installs Mole via Homebrew (if not already installed)
-- Sets up 3 launchd jobs:
-  - **Clean** (Sunday 2 AM) - Removes cache files, logs, etc.
-  - **Optimize** (Wednesday 3 AM) - System optimization
-  - **Update** (Saturday 12 PM) - Keeps Mole up to date
+- Sets up 3 launchd jobs with configurable schedules:
+  - **Clean** (`mo clean`) — removes cache files, logs, etc.
+  - **Optimize** (`mo optimize`) — system optimization
+  - **Update** (`brew upgrade mole`) — keeps Mole up to date
 - Sends macOS notifications on completion
-- All jobs run even if Mac was asleep (catches up on wake)
+- Jobs run even if Mac was asleep (catches up on wake)
 
 ## Installation
 
@@ -19,9 +19,29 @@ Single self-contained script that:
 bash install.sh
 ```
 
+Default schedules: Clean on Sunday 2 AM, Optimize on Wednesday 3 AM, Update on Saturday noon.
+
+## Configure Schedules
+
+Choose schedules interactively before installing:
+
+```bash
+bash install.sh --configure
+```
+
+Presents a numbered menu for each job (Weekly / Daily / Monthly / Skip) with sensible defaults. Press Enter to accept defaults.
+
+## Check Status
+
+Show currently installed schedules and log info without modifying anything:
+
+```bash
+bash install.sh --status
+```
+
 ## Test Mode
 
-Run jobs every 2 minutes for soak testing:
+Run all jobs every 2 minutes for soak testing:
 
 ```bash
 bash install.sh --test-mode
@@ -29,8 +49,27 @@ bash install.sh --test-mode
 
 ## Stop All Jobs
 
+Unload jobs without removing plists:
+
 ```bash
 bash install.sh --stop
+```
+
+## Uninstall
+
+Remove all jobs and plists:
+
+```bash
+bash install.sh --uninstall
+```
+
+## Debug Mode
+
+Print verbose output including plist XML and env info:
+
+```bash
+bash install.sh --debug
+bash install.sh --configure --debug
 ```
 
 ## Verification
@@ -54,26 +93,8 @@ sudo launchctl kickstart system/com.mole.clean
 sudo launchctl kickstart system/com.mole.optimize
 ```
 
-## Uninstall
-
-```bash
-sudo launchctl bootout system/com.mole.clean
-sudo launchctl bootout system/com.mole.optimize
-launchctl bootout gui/$(id -u)/com.mole.update
-sudo rm -f /Library/LaunchDaemons/com.mole.{clean,optimize}.plist
-rm -f ~/Library/LaunchAgents/com.mole.update.plist
-sudo rm -rf /var/log/mole
-```
-
 ## Requirements
 
 - macOS
 - Homebrew installed
 - Run as regular user (not root)
-
-## Family Deployment
-
-Drop `install.sh` on any family Mac and run it. Jobs will automatically:
-- Run in background with low priority
-- Send notifications showing what was done
-- Keep Mole updated weekly
