@@ -264,11 +264,12 @@ if [ "$CONFIGURE_MODE" = true ]; then
         local d_label="$4"     # daily label  e.g. "2 AM"
         local m_label="$5"     # monthly label e.g. "1st of month 2 AM"
 
+        dflt() { [ "$default_choice" = "$1" ] && printf "  (default)" || true; }
         echo "  ${job_label}:" >&2
-        echo "    1) Weekly  — ${w1_label}  (default)" >&2
-        echo "    2) Daily   — ${d_label}" >&2
-        echo "    3) Monthly — ${m_label}" >&2
-        echo "    4) Skip    — don't schedule" >&2
+        echo "    1) Weekly  — ${w1_label}$(dflt 1)" >&2
+        echo "    2) Daily   — ${d_label}$(dflt 2)" >&2
+        echo "    3) Monthly — ${m_label}$(dflt 3)" >&2
+        echo "    4) Skip    — don't schedule$(dflt 4)" >&2
 
         local choice=""
         while true; do
