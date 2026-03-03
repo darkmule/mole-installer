@@ -98,3 +98,7 @@ sudo launchctl kickstart system/com.mole.optimize
 - macOS
 - Homebrew installed
 - Run as regular user (not root)
+
+## License
+
+MIT — see [LICENSE](LICENSE)
