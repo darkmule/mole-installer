@@ -8,10 +8,12 @@ echo ""
 
 # Detect logged-in user
 LOGUSER=$(stat -f%Su /dev/console 2>/dev/null || echo "root")
+[[ "$LOGUSER" =~ ^[a-zA-Z0-9._-]+$ ]] || LOGUSER=root
 echo "1. Logged-in user: $LOGUSER"
 
-# Export HOME
-export HOME=$(eval echo ~$LOGUSER)
+# Export HOME (safe: dscl lookup, no eval)
+LOGHOME=$(dscl . -read /Users/"$LOGUSER" NFSHomeDirectory 2>/dev/null | cut -d' ' -f2)
+export HOME="${LOGHOME:-/var/root}"
 echo "2. HOME set to: $HOME"
 
 # Timestamp

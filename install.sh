@@ -233,6 +233,24 @@ CLEAN_TYPE="weekly"; CLEAN_WEEKDAY=0; CLEAN_HOUR=2
 OPT_TYPE="weekly";   OPT_WEEKDAY=3;   OPT_HOUR=3
 UPD_TYPE="weekly";   UPD_WEEKDAY=6;   UPD_HOUR=12
 
+# ─── Load saved schedule preferences ─────────────────────────────────────────
+CONFIG_DIR="$HOME/.config/mole"
+CONFIG_FILE="$CONFIG_DIR/schedule"
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+type_to_choice() {
+    case "$1" in
+        weekly)  echo 1 ;;
+        daily)   echo 2 ;;
+        monthly) echo 3 ;;
+        skip)    echo 4 ;;
+        *)       echo 1 ;;
+    esac
+}
+
 # ─── Configure mode ───────────────────────────────────────────────────────────
 
 if [ "$CONFIGURE_MODE" = true ]; then
@@ -267,7 +285,7 @@ if [ "$CONFIGURE_MODE" = true ]; then
     }
 
     # Clean
-    CLEAN_CHOICE=$(prompt_schedule "mo clean" "1" "Sunday 2 AM" "2 AM" "1st of month 2 AM")
+    CLEAN_CHOICE=$(prompt_schedule "mo clean" "$(type_to_choice "$CLEAN_TYPE")" "Sunday 2 AM" "2 AM" "1st of month 2 AM")
     case "$CLEAN_CHOICE" in
         1) CLEAN_TYPE="weekly";  CLEAN_WEEKDAY=0; CLEAN_HOUR=2 ;;
         2) CLEAN_TYPE="daily";   CLEAN_HOUR=2 ;;
@@ -276,7 +294,7 @@ if [ "$CONFIGURE_MODE" = true ]; then
     esac
 
     # Optimize
-    OPT_CHOICE=$(prompt_schedule "mo optimize" "1" "Wednesday 3 AM" "3 AM" "1st of month 3 AM")
+    OPT_CHOICE=$(prompt_schedule "mo optimize" "$(type_to_choice "$OPT_TYPE")" "Wednesday 3 AM" "3 AM" "1st of month 3 AM")
     case "$OPT_CHOICE" in
         1) OPT_TYPE="weekly";  OPT_WEEKDAY=3; OPT_HOUR=3 ;;
         2) OPT_TYPE="daily";   OPT_HOUR=3 ;;
@@ -285,7 +303,7 @@ if [ "$CONFIGURE_MODE" = true ]; then
     esac
 
     # Update
-    UPD_CHOICE=$(prompt_schedule "brew upgrade mole" "1" "Saturday noon" "noon" "1st of month noon")
+    UPD_CHOICE=$(prompt_schedule "brew upgrade mole" "$(type_to_choice "$UPD_TYPE")" "Saturday noon" "noon" "1st of month noon")
     case "$UPD_CHOICE" in
         1) UPD_TYPE="weekly";  UPD_WEEKDAY=6; UPD_HOUR=12 ;;
         2) UPD_TYPE="daily";   UPD_HOUR=12 ;;
@@ -324,6 +342,22 @@ if [ "$CONFIGURE_MODE" = true ]; then
         echo "Aborted."
         exit 0
     fi
+
+    # Save schedule preferences for next run
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+# Mole schedule preferences — saved $(date "+%Y-%m-%d %H:%M")
+CLEAN_TYPE="$CLEAN_TYPE"
+CLEAN_WEEKDAY=${CLEAN_WEEKDAY:-0}
+CLEAN_HOUR=${CLEAN_HOUR:-2}
+OPT_TYPE="$OPT_TYPE"
+OPT_WEEKDAY=${OPT_WEEKDAY:-3}
+OPT_HOUR=${OPT_HOUR:-3}
+UPD_TYPE="$UPD_TYPE"
+UPD_WEEKDAY=${UPD_WEEKDAY:-6}
+UPD_HOUR=${UPD_HOUR:-12}
+EOF
+    echo "  Preferences saved to $CONFIG_FILE"
     echo ""
 fi
 
@@ -480,9 +514,9 @@ echo ""
 echo "==> Installing LaunchDaemons..."
 
 # Shared inline command strings (XML-escaped for plist)
-CLEAN_CMD='export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; LOGUSER=$(stat -f%Su /dev/console 2>/dev/null || echo "root"); export HOME=$(eval echo ~$LOGUSER); TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S"); echo "[$TIMESTAMP] Starting mo clean" >> /var/log/mole/clean.log; OUTPUT=$(mo clean 2>&1); EXITCODE=$?; echo "$OUTPUT" >> /var/log/mole/clean.log; echo "[$TIMESTAMP] Finished (exit code: $EXITCODE)" >> /var/log/mole/clean.log; if [ $EXITCODE -eq 0 ]; then SAVED=$(echo "$OUTPUT" | grep "Space freed:" | grep -oE "[0-9]+(\.[0-9]+)?\s*(GB|MB|KB|B)" | head -1); if [ "$LOGUSER" != "root" ] && [ -n "$SAVED" ]; then LOGUID=$(id -u "$LOGUSER"); launchctl asuser "$LOGUID" sudo -u "$LOGUSER" osascript -e "display notification \"Freed: $SAVED\" with title \"Mole Clean Complete\"" 2>> /var/log/mole/clean.log || true; fi; fi'
+CLEAN_CMD='export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; LOGUSER=$(stat -f%Su /dev/console 2>/dev/null || echo "root"); [[ "$LOGUSER" =~ ^[a-zA-Z0-9._-]+$ ]] || LOGUSER=root; LOGHOME=$(dscl . -read /Users/"$LOGUSER" NFSHomeDirectory 2>/dev/null | cut -d" " -f2); export HOME=${LOGHOME:-/var/root}; TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S"); echo "[$TIMESTAMP] Starting mo clean" >> /var/log/mole/clean.log; OUTPUT=$(mo clean 2>&1); EXITCODE=$?; echo "$OUTPUT" >> /var/log/mole/clean.log; echo "[$TIMESTAMP] Finished (exit code: $EXITCODE)" >> /var/log/mole/clean.log; if [ $EXITCODE -eq 0 ]; then SAVED=$(echo "$OUTPUT" | grep "Space freed:" | grep -oE "[0-9]+(\.[0-9]+)?\s*(GB|MB|KB|B)" | head -1); if [ "$LOGUSER" != "root" ] && [ -n "$SAVED" ]; then LOGUID=$(id -u "$LOGUSER"); launchctl asuser "$LOGUID" sudo -u "$LOGUSER" osascript -e "display notification \"Freed: $SAVED\" with title \"Mole Clean Complete\"" 2>> /var/log/mole/clean.log || true; fi; fi'
 
-OPT_CMD='export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; LOGUSER=$(stat -f%Su /dev/console 2>/dev/null || echo "root"); export HOME=$(eval echo ~$LOGUSER); TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S"); echo "[$TIMESTAMP] Starting mo optimize" >> /var/log/mole/optimize.log; OUTPUT=$(mo optimize 2>&1); EXITCODE=$?; echo "$OUTPUT" >> /var/log/mole/optimize.log; echo "[$TIMESTAMP] Finished (exit code: $EXITCODE)" >> /var/log/mole/optimize.log; if [ $EXITCODE -eq 0 ] && [ "$LOGUSER" != "root" ]; then LOGUID=$(id -u "$LOGUSER"); launchctl asuser "$LOGUID" sudo -u "$LOGUSER" osascript -e "display notification \"Optimize completed\" with title \"Mole Optimize Complete\"" 2>> /var/log/mole/optimize.log || true; fi'
+OPT_CMD='export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; LOGUSER=$(stat -f%Su /dev/console 2>/dev/null || echo "root"); [[ "$LOGUSER" =~ ^[a-zA-Z0-9._-]+$ ]] || LOGUSER=root; LOGHOME=$(dscl . -read /Users/"$LOGUSER" NFSHomeDirectory 2>/dev/null | cut -d" " -f2); export HOME=${LOGHOME:-/var/root}; TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S"); echo "[$TIMESTAMP] Starting mo optimize" >> /var/log/mole/optimize.log; OUTPUT=$(mo optimize 2>&1); EXITCODE=$?; echo "$OUTPUT" >> /var/log/mole/optimize.log; echo "[$TIMESTAMP] Finished (exit code: $EXITCODE)" >> /var/log/mole/optimize.log; if [ $EXITCODE -eq 0 ] && [ "$LOGUSER" != "root" ]; then LOGUID=$(id -u "$LOGUSER"); launchctl asuser "$LOGUID" sudo -u "$LOGUSER" osascript -e "display notification \"Optimize completed\" with title \"Mole Optimize Complete\"" 2>> /var/log/mole/optimize.log || true; fi'
 
 UPD_CMD='export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S"); echo "[$TIMESTAMP] Starting brew upgrade mole" >> /tmp/mole-update.log; export HOMEBREW_NO_AUTO_UPDATE=1; OUTPUT=$(brew upgrade mole 2>&1); EXITCODE=$?; echo "$OUTPUT" >> /tmp/mole-update.log; echo "[$TIMESTAMP] Finished (exit code: $EXITCODE)" >> /tmp/mole-update.log; if [ $EXITCODE -eq 0 ]; then if echo "$OUTPUT" | grep -qi "already"; then MSG="Already up to date"; else MSG="Updated successfully"; fi; osascript -e "display notification \"$MSG\" with title \"Mole Update\"" 2>/dev/null || true; else MSG="Update failed (check log)"; osascript -e "display notification \"$MSG\" with title \"Mole Update\"" 2>/dev/null || true; fi'
 
